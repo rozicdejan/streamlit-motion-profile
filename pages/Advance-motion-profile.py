@@ -8,7 +8,7 @@ import streamlit as st
 # =========================
 # Motion & Physics Helpers
 # =========================
-def calc_profile(positions, acc_time, dec_time, max_velocity=None):
+def calc_profile(positions, delays_ms, acc_time, dec_time, max_velocity=None):
     if len(positions) < 2:
         return None
 
@@ -19,21 +19,27 @@ def calc_profile(positions, acc_time, dec_time, max_velocity=None):
 
     for i in range(len(positions) - 1):
         p0, p1 = positions[i], positions[i+1]
-        dist = abs(p1 - p0)
-        dirn = 1 if p1 >= p0 else -1
 
-        if dist == 0:
-            dt_idle = 0.1
-            segments.append(dict(p0=p0, p1=p1, dist=0.0, dir=dirn,
-                                 t_acc=0.0, t_const=dt_idle, t_dec=0.0,
-                                 vmax=0.0, t0=total_time, t1=total_time+dt_idle))
+        # --- Delay before this move ---
+        delay_s = delays_ms[i] / 1000.0 if i < len(delays_ms) else 0.0
+        if delay_s > 0:
+            segments.append(dict(p0=p0, p1=p0, dist=0.0, dir=0,
+                                 t_acc=0.0, t_const=delay_s, t_dec=0.0,
+                                 vmax=0.0, t0=total_time, t1=total_time + delay_s,
+                                 is_delay=True))
             phase_markers.append({
                 "t_acc_end": total_time,
-                "t_const_end": total_time + dt_idle,
-                "t_dec_end": total_time + dt_idle
+                "t_const_end": total_time + delay_s,
+                "t_dec_end": total_time + delay_s,
+                "is_delay": True
             })
-            total_time += dt_idle
+            total_time += delay_s
             seg_end_times.append(total_time)
+
+        # --- Normal motion segment ---
+        dist = abs(p1 - p0)
+        dirn = 1 if p1 >= p0 else -1
+        if dist == 0:
             continue
 
         if (max_velocity is None) and (acc_time + dec_time) > 0:
@@ -53,18 +59,21 @@ def calc_profile(positions, acc_time, dec_time, max_velocity=None):
         segments.append(dict(
             p0=p0, p1=p1, dist=dist, dir=dirn,
             t_acc=acc_time, t_const=t_const, t_dec=dec_time,
-            vmax=vmax * dirn, t0=total_time, t1=total_time + t_seg
+            vmax=vmax * dirn, t0=total_time, t1=total_time + t_seg,
+            is_delay=False
         ))
 
         phase_markers.append({
             "t_acc_end": total_time + acc_time,
             "t_const_end": total_time + acc_time + t_const,
-            "t_dec_end": total_time + t_seg
+            "t_dec_end": total_time + t_seg,
+            "is_delay": False
         })
 
         total_time += t_seg
         seg_end_times.append(total_time)
 
+    # --- Simulation arrays ---
     dt = 0.01
     t = np.arange(0, total_time + dt, dt)
     pos = np.zeros_like(t)
@@ -87,29 +96,27 @@ def calc_profile(positions, acc_time, dec_time, max_velocity=None):
             continue
 
         tau = tt - seg['t0']
-        t_acc, t_const, t_dec = seg['t_acc'], seg['t_const'], seg['t_dec']
-        vmax, p0 = seg['vmax'], seg['p0']
-
-        if seg['dist'] == 0:
-            a = 0.0; v = 0.0; p = p0
-        elif tau <= t_acc:
-            a = vmax / t_acc if t_acc > 0 else 0.0
-            v = a * tau
-            p = p0 + 0.5 * a * tau**2
-        elif tau <= t_acc + t_const:
-            a = 0.0
-            v = vmax
-            p = p0 + 0.5 * vmax * t_acc + vmax * (tau - t_acc)
+        if seg['is_delay']:
+            a = 0.0; v = 0.0; p = seg['p0']
         else:
-            td = tau - t_acc - t_const
-            a = -vmax / t_dec if t_dec > 0 else 0.0
-            v = vmax + a * td
-            d_acc_const = 0.5 * vmax * t_acc + vmax * t_const
-            p = p0 + d_acc_const + vmax * td + 0.5 * a * td**2
+            t_acc, t_const, t_dec = seg['t_acc'], seg['t_const'], seg['t_dec']
+            vmax, p0 = seg['vmax'], seg['p0']
+            if tau <= t_acc:
+                a = vmax / t_acc if t_acc > 0 else 0.0
+                v = a * tau
+                p = p0 + 0.5 * a * tau**2
+            elif tau <= t_acc + t_const:
+                a = 0.0
+                v = vmax
+                p = p0 + 0.5 * vmax * t_acc + vmax * (tau - t_acc)
+            else:
+                td = tau - t_acc - t_const
+                a = -vmax / t_dec if t_dec > 0 else 0.0
+                v = vmax + a * td
+                d_acc_const = 0.5 * vmax * t_acc + vmax * t_const
+                p = p0 + d_acc_const + vmax * td + 0.5 * a * td**2
 
-        pos[i] = p
-        vel[i] = v
-        acc[i] = a
+        pos[i], vel[i], acc[i] = p, v, a
         if i > 0:
             cum_dist[i] = cum_dist[i-1] + abs(v) * dt
 
@@ -137,8 +144,8 @@ def estimate_power(acc_units, vel_units, unit_to_m=0.001, mass_kg=5.0,
 # =========================
 def main():
     st.set_page_config(page_title="Motion Profile Lab", layout="wide")
-    st.title("🚀 Motion Profile Lab")
-    st.caption("Overlay profiles • Shaded phases • Cumulative distance • Power/Energy • Playback")
+    st.title("🚀 Motion Profile Lab with Delays")
+    st.caption("Now supports delays (dwells) between waypoints in ms")
 
     # Sidebar — Inputs
     st.sidebar.header("Waypoints & Parameters")
@@ -146,22 +153,37 @@ def main():
     unit_to_m = 0.001 if unit == "mm" else 1.0
 
     if 'positions' not in st.session_state:
-        st.session_state.positions = [0, 500, 0, 560, 0, 620, 0]
+        st.session_state.positions = [0, 500, 0, 560, 0]
+    if 'delays' not in st.session_state:
+        st.session_state.delays = [0] * (len(st.session_state.positions)-1)
 
     npts = st.sidebar.number_input("Number of waypoints", 2, 50, len(st.session_state.positions))
     if len(st.session_state.positions) < npts:
         st.session_state.positions.extend([0] * (npts - len(st.session_state.positions)))
+        st.session_state.delays.extend([0] * (npts - len(st.session_state.delays) - 1))
     elif len(st.session_state.positions) > npts:
         st.session_state.positions = st.session_state.positions[:npts]
+        st.session_state.delays = st.session_state.delays[:npts-1]
 
+    positions = []
+    delays = []
     for i in range(npts):
-        st.session_state.positions[i] = st.sidebar.number_input(
+        pos_val = st.sidebar.number_input(
             f"Position {i+1} ({unit})",
             value=float(st.session_state.positions[i]),
             step=1.0 if unit == "mm" else 0.001,
             format="%.3f" if unit == "m" else "%.0f"
         )
-    positions = st.session_state.positions
+        positions.append(pos_val)
+        if i < npts-1:
+            delay_val = st.sidebar.number_input(
+                f"Delay after P{i+1} (ms)", 0, 60000,
+                value=int(st.session_state.delays[i])
+            )
+            delays.append(delay_val)
+
+    st.session_state.positions = positions
+    st.session_state.delays = delays
 
     st.sidebar.subheader("Motion Params")
     acc_time = st.sidebar.number_input("Acceleration time (s)", 0.01, 60.0, 0.5, 0.01)
@@ -178,11 +200,12 @@ def main():
     if st.sidebar.button("➕ Add Profile"):
         if "profiles" not in st.session_state:
             st.session_state.profiles = []
-        result = calc_profile(positions, acc_time, dec_time, vmax)
+        result = calc_profile(positions, delays, acc_time, dec_time, vmax)
         if result is not None:
             t, p, v, a, cd, markers, seg_ends = result
             st.session_state.profiles.append({
                 "positions": positions.copy(),
+                "delays": delays.copy(),
                 "acc": acc_time, "dec": dec_time, "vmax": vmax,
                 "t": t, "pos": p, "vel": v, "acc": a,
                 "cumdist": cd, "markers": markers, "seg_ends": seg_ends,
@@ -243,77 +266,25 @@ def main():
         fig.add_trace(go.Scatter(x=t, y=cd, name=f"Cum {label}", line=dict(color=color)), row=4, col=1)
 
         for m in prof["markers"]:
-            fig.add_vrect(x0=m["t_acc_end"]-prof["acc"], x1=m["t_acc_end"],
-                          fillcolor="lightgreen", opacity=0.18, line_width=0, row=2, col=1)
-            fig.add_vrect(x0=m["t_acc_end"], x1=m["t_const_end"],
-                          fillcolor="lightblue", opacity=0.18, line_width=0, row=2, col=1)
-            fig.add_vrect(x0=m["t_const_end"], x1=m["t_dec_end"],
-                          fillcolor="salmon", opacity=0.18, line_width=0, row=2, col=1)
-
-        y_vals = np.interp(prof["seg_ends"], t, cd)
-        fig.add_trace(go.Scatter(x=prof["seg_ends"], y=y_vals, mode="markers",
-                                 marker=dict(symbol="x", size=8), showlegend=False), row=4, col=1)
+            if m.get("is_delay", False):
+                fig.add_vrect(x0=m["t_acc_end"], x1=m["t_dec_end"],
+                              fillcolor="yellow", opacity=0.25, line_width=0, row=2, col=1)
+            else:
+                fig.add_vrect(x0=m["t_acc_end"]-prof["acc"], x1=m["t_acc_end"],
+                              fillcolor="lightgreen", opacity=0.18, line_width=0, row=2, col=1)
+                fig.add_vrect(x0=m["t_acc_end"], x1=m["t_const_end"],
+                              fillcolor="lightblue", opacity=0.18, line_width=0, row=2, col=1)
+                fig.add_vrect(x0=m["t_const_end"], x1=m["t_dec_end"],
+                              fillcolor="salmon", opacity=0.18, line_width=0, row=2, col=1)
 
         P, E, Epos = estimate_power(a, v, unit_to_m=prof["unit_to_m"],
                                     mass_kg=prof["mass_kg"], coulomb_fric_N=prof["coulomb"],
                                     visc_fric_N_per_unit_s=prof["visc"])
         fig.add_trace(go.Scatter(x=t, y=P, name=f"Power {i+1}", line=dict(color=color)), row=5, col=1)
 
-    fig.update_layout(height=1100, title="Motion Profiles", title_x=0.5, legend=dict(orientation="h"))
+    fig.update_layout(height=1100, title="Motion Profiles (with Delays)", title_x=0.5, legend=dict(orientation="h"))
     fig.update_xaxes(title_text="Time (s)", row=5, col=1)
     st.plotly_chart(fig, use_container_width=True)
-
-    # =========================
-    # Playback (interactive)
-    # =========================
-    st.subheader("▶️ Playback")
-    play_idx = st.selectbox("Profile for playback",
-                            options=list(range(1, len(st.session_state.profiles)+1)),
-                            index=len(st.session_state.profiles)-1) - 1
-    pprof = st.session_state.profiles[play_idx]
-    tb, pb = pprof["t"], pprof["pos"]
-
-    if "play_time" not in st.session_state:
-        st.session_state.play_time = 0.0
-    if "is_playing" not in st.session_state:
-        st.session_state.is_playing = False
-    if "play_speed" not in st.session_state:
-        st.session_state.play_speed = 1.0
-
-    play_cols = st.columns([1,1,2,2,2])
-    with play_cols[0]:
-        if st.button("▶️ Play" if not st.session_state.is_playing else "⏸ Pause"):
-            st.session_state.is_playing = not st.session_state.is_playing
-    with play_cols[1]:
-        if st.button("⏮ Reset"):
-            st.session_state.play_time = 0.0
-    with play_cols[2]:
-        st.session_state.play_speed = st.slider("Speed ×", 0.25, 4.0, st.session_state.play_speed, 0.25)
-    with play_cols[3]:
-        st.session_state.play_time = st.slider("Playback time (s)", 0.0, float(tb[-1]),
-                                               float(st.session_state.play_time), 0.01)
-    with play_cols[4]:
-        st.caption("Tip: Use >1× to fast-forward")
-
-    y_curr = np.interp(st.session_state.play_time, tb, pb)
-    pb_fig = go.Figure()
-    pb_fig.add_trace(go.Scatter(x=tb, y=pb, mode="lines", name="Position"))
-    pb_fig.add_trace(go.Scatter(x=[st.session_state.play_time], y=[y_curr],
-                                mode="markers", marker=dict(size=12, symbol="circle-open"),
-                                name="Marker"))
-    pb_fig.update_layout(height=300, title=f"Playback — Profile {play_idx+1}", showlegend=False)
-    pb_fig.update_xaxes(title="Time (s)")
-    pb_fig.update_yaxes(title=f"Position ({unit})")
-    st.plotly_chart(pb_fig, use_container_width=True)
-
-    if st.session_state.is_playing:
-        next_time = st.session_state.play_time + 0.03 * st.session_state.play_speed
-        if next_time > tb[-1]:
-            next_time = tb[-1]
-            st.session_state.is_playing = False
-        st.session_state.play_time = float(next_time)
-        time.sleep(0.03)
-        st.rerun()
 
     # =========================
     # Data & Download
@@ -345,24 +316,6 @@ def main():
         <div style="font-size:13px; color:gray; text-align:center; margin-top:10px;">
             Made by <b>Dejan Rožič</b><br>for <b>Dafra d.o.o.</b>
         </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    # Stick to bottom
-    st.markdown(
-        """
-        <style>
-        [data-testid="stSidebar"] img {
-            margin-top: 50px;
-        }
-        [data-testid="stSidebar"] div.block-container {
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-            height: 100%;
-        }
-        </style>
         """,
         unsafe_allow_html=True
     )
